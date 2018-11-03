@@ -153,24 +153,12 @@ module OrcaApi
       # @see http://cms-edit.orca.med.or.jp/receipt/tec/api/haori_patientmod.data/api12v032.pdf
       # @see http://cms-edit.orca.med.or.jp/receipt/tec/api/haori_patientmod.data/api12v032_err.pdf
       def update(id, args)
-        res = call_01(id)
-        if !res.locked?
-          locked_result = res
-        end
-        if !res.ok?
-          return res
-        end
-        res = call_02(args, res)
-        if !res.ok?
-          return res
-        end
-        res = call_03_with_answer(args, res)
-        if res.ok?
-          locked_result = nil
-        end
-        res
-      ensure
-        unlock(locked_result)
+        result01 = call_01 id
+        return result01 if result01.locked?
+
+        result02 = call_02 args, result01
+
+        call_03 args, result02
       end
 
       private
@@ -186,52 +174,84 @@ module OrcaApi
         call(req)
       end
 
-      def call_02(args, res)
+      def call_02(args, result01)
         req = {
-          "Request_Number" => res.response_number,
-          "Karte_Uid" => res.karte_uid,
-          "Orca_Uid" => res.orca_uid,
-          "Patient_Information" => res.patient_information,
-        }
-        copy_attributes args, req, copy_attribute_names
+          "Request_Number" => result01.response_number,
+          "Karte_Uid" => result01.karte_uid,
+          "Orca_Uid" => result01.orca_uid,
+          "Patient_Information" => result01.patient_information,
+        }.merge(merge_insurance_informations(args, result01))
         call(req)
       end
 
-      def call_03(res, answer = nil)
-        req = {
-          "Request_Number" => res.response_number,
-          "Karte_Uid" => res.karte_uid,
-          "Orca_Uid" => res.orca_uid,
-          "Patient_Information" => res.patient_information,
-        }
-        copy_attributes res, req, copy_attribute_names
-        if answer
-          req["Select_Answer"] = answer["Select_Answer"]
+      def merge_insurance_informations(args, result01)
+        health_infos = Array(args.dig("HealthInsurance_Information", "HealthInsurance_Info"))
+        public_infos = Array(args.dig("PublicInsurance_Information", "PublicInsurance_Info"))
+
+        health_insurance_info = result01.health_insurance_info.map do |health_info|
+          id = health_info["InsuranceProvider_Id"]
+          (
+            health_infos.find { |e| e["InsuranceProvider_Id"] == id } ||
+            health_info.merge("InsuranceProvider_Mode" => "")
+          )
         end
-        call(req)
+
+        public_insurance_info = result01.public_insurance_info.map do |public_info|
+          id = public_info["PublicInsurance_Id"]
+          (
+            public_infos.find { |e| e["PublicInsurance_Id"] == id } ||
+            public_info.merge("PublicInsurance_Mode" => "")
+          )
+        end
+
+        {
+          "HealthInsurance_Information" => { "HealthInsurance_Info" => health_insurance_info }
+          "PublicInsurance_Information" => { "PublicInsurance_Info" => public_insurance_info }
+        }
       end
 
-      def call_03_with_answer(params, previous_result)
-        res = call_03(previous_result)
-        return res if res.ok?
+      def call_03(args, result02)
+        req = {
+          "Request_Number" => result02.response_number,
+          "Karte_Uid" => result02.karte_uid,
+          "Orca_Uid" => result02.orca_uid,
+          "Patient_Information" => result02.patient_information,
+          "HealthInsurance_Information" => { "HealthInsurance_Info" => result02.health_insurance_info },
+          "PublicInsurance_Information" => { "PublicInsurance_Info" => result02.public_insurance_info }
+        }
 
-        while !res.ok?
-          if res.api_result == "S20"
-            ps = res.patient_select_information["Patient_Select"]
-            psm = res.patient_select_information["Patient_Select_Message"]
-            psi = Array(params["Patient_Select_Information"]).find do |e|
-              ps == e["Patient_Select"] && psm == e["Patient_Select_Message"]
-            end
+        loop do
+          result03 = call(req)
+
+          if result03.api_result == "S20"
+            psi = find_select_answer result03.patient_select_information, params["Patient_Select_Information"]
             if psi
-              res = call_03(res, psi)
+              req["Select_Answer"] = psi["Select_Answer"]
+              next
             else
-              return UnselectedError.new(res.raw)
+              result03 = UnselectedError.new(result03.raw)
             end
-          else
-            break
           end
+
+          break
         end
-        res
+
+        if result03.response_number != "00"
+          unlock result02
+        end
+
+        result03
+      end
+
+      def find_select_answer(patient_select_information, candidates)
+        patient_select = patient_select_information["Patient_Select"]
+        patient_select_message = patient_select_information["Patient_Select_Message"]
+        Array(candidates).find do |e|
+          (
+            patient_select == e["Patient_Select"] &&
+            patient_select_message == e["Patient_Select_Message"]
+          )
+        end
       end
 
       def unlock(locked_result)
@@ -247,7 +267,14 @@ module OrcaApi
       end
 
       def call(req)
-        Result.new(orca_api.call("/orca12/patientmodv32", body: { "patientmodv3req2" => req }))
+        Result.new(
+          orca_api.call(
+            "/orca12/patientmodv32",
+            body: {
+              "patientmodv3req2" => req
+            }
+          )
+        )
       end
 
       def copy_attributes(src, dst, attrs)
